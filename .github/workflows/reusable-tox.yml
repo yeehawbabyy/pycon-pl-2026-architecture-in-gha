@@ -1,3 +1,10 @@
+---
+# PHASE D checkpoint: adds Pattern 5's explicit color/encoding env block
+# (Exhibit B) on top of Phase C's hooks + three-stage execution. This is
+# the final state of the reusable workflow built live in the workshop --
+# see reference/reusable-tox-annotated.md for the full real production
+# version (22 inputs; this teaching version deliberately keeps only the
+# inputs needed for the 5 patterns).
 
 name: >-
   ❌
@@ -27,13 +34,71 @@ on:
       xfail:
         description: >-
           Whether this job is expected to fail. The job status is treated
-          as successful if this is set to `true`.
+          as successful if this is set to `true`. One deliberate exception
+          exists below: prerelease Pythons get auto-forgiveness without
+          this being set (Pattern 5's one narrow escape hatch).
         required: true
         type: string
       check-name:
         description: A custom name for the Checks API-reported status
         required: false
         type: string
+      tox-provision-args:
+        description: Tox arguments to pass to the env provisioning run
+        required: false
+        type: string
+      tox-run-args:
+        description: Tox arguments to pass to the regular run
+        required: false
+        type: string
+      tox-rerun-args:
+        description: Tox arguments to pass to the re-attempted run
+        required: false
+        type: string
+      tox-run-posargs:
+        description: Positional arguments to pass to the regular tox run
+        required: false
+        type: string
+      tox-rerun-posargs:
+        description: Positional arguments to pass to the re-attempted tox run
+        required: false
+        type: string
+      job-dependencies-context:
+        default: >-
+          {}
+        description: >-
+          The `$ {{ needs }}` context passed from the calling workflow
+          encoded as a JSON string:
+          `job-dependencies-context: $ {{ toJSON(needs) }}`.
+        required: false
+        type: string
+
+# --- Pattern 5, Exhibit B: "explicit over implicit has a cost" -----------
+# Thirteen different Python/CI tools each recognize a different env var to
+# request colored output -- there is no single shared convention. This
+# block is the explicit price paid so CI logs aren't flat and gray.
+# `TOX_TESTENV_PASSENV` is itself real tox behavior (not a GitHub Actions
+# feature): setting it widens every testenv's passenv list *without*
+# editing tox.ini -- notice tox.ini's own `passenv` line from Phase B/C
+# still works standalone, but a real project would rely on this instead of
+# hand-maintaining passenv per project.
+env:
+  COLOR: >-  # Supposedly, pytest or coveragepy use this
+    yes
+  FORCE_COLOR: 1
+  PY_COLORS: 1
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: 1
+  TOX_PARALLEL_NO_SPINNER: 1
+  TOX_TESTENV_PASSENV: >-
+    CI
+    COLOR
+    FORCE_COLOR
+    GITHUB_ACTIONS
+    GITHUB_OUTPUT
+    PY_COLORS
+    PYTHONIOENCODING
+    PYTHONUTF8
 
 jobs:
   tox:
@@ -63,6 +128,9 @@ jobs:
           ) && true || false
       }}
 
+    outputs:
+      steps: ${{ toJSON(steps) }}
+
     env:
       TOXENV: ${{ inputs.toxenv }}
 
@@ -77,6 +145,125 @@ jobs:
     - name: Grab the source from Git
       uses: actions/checkout@v5
 
-    # Phase B adds: install tox, then the three-stage execution.
-    # Phase C adds: the four hook invocation points around those stages.
-    # Phase D adds: the Pattern-5 explicit-env-var block.
+    - name: 🪝 Invoke the in-repo `post-src-checkout` hook (if exists)
+      id: hook-post-src-checkout
+      if: >-  # `hashFiles()` is used as a rudimentary `file.exists()`
+        !cancelled()
+        && hashFiles(
+          '.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-src-checkout/action.yml'
+        ) != ''
+      uses: ./.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-src-checkout
+      with:
+        calling-job-context: ${{ toJSON(inputs) }}
+        current-job-steps: ${{ toJSON(steps) }}
+        job-dependencies-context: ${{ inputs.job-dependencies-context }}
+
+    - name: Install tox
+      run: python -Im pip install tox tox-uv
+
+    # --- STAGE 1: provision -------------------------------------------
+    - name: >-
+        Pre-populate tox envs: `${{ env.TOXENV }}`
+      run: >-
+        python -Xutf8 -Im
+        tox
+        --parallel auto
+        --parallel-live
+        --skip-missing-interpreters false
+        ${{ inputs.tox-provision-args }}
+        --notest
+
+    - name: 🪝 Invoke the in-repo `prepare-for-tox-run` hook (if exists)
+      id: hook-prepare-for-tox-run
+      if: >-
+        !cancelled()
+        && hashFiles(
+          '.github/reusables/tox-dev/workflow/reusable-tox/hooks/prepare-for-tox-run/action.yml'
+        ) != ''
+      uses: ./.github/reusables/tox-dev/workflow/reusable-tox/hooks/prepare-for-tox-run
+      with:
+        calling-job-context: ${{ toJSON(inputs) }}
+        current-job-steps: ${{ toJSON(steps) }}
+        job-dependencies-context: ${{ inputs.job-dependencies-context }}
+
+    # --- STAGE 2: the real run ------------------------------------------
+    - name: >-
+        Run tox envs: `${{ env.TOXENV }}`
+      id: tox-run
+      run: >-
+        python -Xutf8 -Im
+        tox
+        --parallel auto
+        --parallel-live
+        --skip-missing-interpreters false
+        --skip-pkg-install
+        --quiet
+        ${{ inputs.tox-run-args }}
+        ${{
+          inputs.tox-run-posargs != ''
+          && format('-- {0}', inputs.tox-run-posargs)
+          || ''
+        }}
+
+    - name: 🪝 Invoke the in-repo `post-tox-run` hook (if exists)
+      id: hook-post-tox-run
+      if: >-
+        !cancelled()
+        && steps.tox-run.outcome != 'skipped'
+        && hashFiles(
+          '.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-tox-run/action.yml'
+        ) != ''
+      uses: ./.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-tox-run
+      with:
+        calling-job-context: ${{ toJSON(inputs) }}
+        current-job-steps: ${{ toJSON(steps) }}
+        job-dependencies-context: ${{ inputs.job-dependencies-context }}
+
+    - name: Explain re-runing the failing tests
+      if: >-
+        !cancelled()
+        && steps.tox-run.outcome == 'failure'
+        && inputs.tox-rerun-posargs != ''
+      run: >-
+        {
+          echo '> [!IMPORTANT]';
+          echo '> The main tox command failed. Re-running now with maximum';
+          echo '> verbosity to help you troubleshoot. This second run is';
+          echo '> intentionally marked failing even if it happens to pass --';
+          echo '> compare the two runs to tell a real failure from a flaky one.';
+        } | tee -a "${GITHUB_STEP_SUMMARY}"
+      shell: bash -eEuo pipefail {0}
+
+    # --- STAGE 3: debug rerun, only on failure --------------------------
+    - name: Re-run the failing tests with maximum verbosity
+      if: >-
+        !cancelled()
+        && steps.tox-run.outcome == 'failure'
+        && inputs.tox-rerun-posargs != ''
+      run: >-  # `exit 1` makes sure that the job remains red with flaky runs
+        python -Xutf8 -Im
+        tox
+        --parallel auto
+        --parallel-live
+        --skip-missing-interpreters false
+        -vvvvv
+        --skip-pkg-install
+        ${{ inputs.tox-rerun-args }}
+        --
+        ${{ inputs.tox-rerun-posargs }}
+        && exit 1
+      shell: bash
+
+    - name: 🪝 Invoke the in-repo `post-tox-job` hook (if exists)
+      id: hook-post-tox-job
+      if: >-  # fires even if `tox-run` never ran -- last-chance cleanup hook
+        !cancelled()
+        && hashFiles(
+          '.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-tox-job/action.yml'
+        ) != ''
+      uses: ./.github/reusables/tox-dev/workflow/reusable-tox/hooks/post-tox-job
+      with:
+        calling-job-context: ${{ toJSON(inputs) }}
+        current-job-steps: ${{ toJSON(steps) }}
+        job-dependencies-context: ${{ inputs.job-dependencies-context }}
+
